@@ -1,0 +1,135 @@
+name: Build
+permissions:
+  contents: write
+
+on:
+  schedule:
+    - cron: "0 3 * * 1"
+  workflow_dispatch:
+  push:
+    paths:
+      - ".github/workflows/build.yml"
+      - ".github/scripts/**"
+    branches: [main]
+
+concurrency:
+  group: build
+  cancel-in-progress: false
+
+env:
+  SPC_VERSION: "2.8.5"
+
+jobs:
+  build:
+    name: PHP ${{ matrix.php }} - ${{ matrix.conf.target }} - ${{ matrix.tier }}
+    runs-on: ${{ matrix.conf.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        php: ["8.4", "8.5"]
+        tier: ["phui"]
+        conf:
+          - { os: macos-latest, target: macos-aarch64, spc: spc-macos-aarch64 }
+          - { os: macos-15-intel, target: macos-x86_64, spc: spc-macos-x86_64 }
+          - { os: ubuntu-latest, target: linux-x86_64, spc: spc-linux-x86_64 }
+          - { os: ubuntu-24.04-arm, target: linux-aarch64, spc: spc-linux-aarch64 }
+
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Download pinned static-php-cli
+        run: |
+          curl --fail --silent --show-error --location --output spc.tar.gz \
+            "https://github.com/crazywhalecc/static-php-cli/releases/download/${SPC_VERSION}/${{ matrix.conf.spc }}.tar.gz"
+          tar --extract --gzip --file spc.tar.gz
+          chmod +x spc
+          ./spc --version
+
+      - name: Read the tier's extension list
+        run: |
+          echo "EXTENSIONS=$(python3 .github/scripts/tools.py get-extensions-for-tier "${{ matrix.tier }}")" >> "$GITHUB_ENV"
+
+      - name: Doctor
+        run: ./spc doctor --auto-fix
+
+      - name: Cache source downloads
+        uses: actions/cache@v6
+        with:
+          path: downloads
+          key: spc-dl-${{ env.SPC_VERSION }}-${{ matrix.conf.target }}-${{ matrix.php }}-${{ matrix.tier }}-${{ hashFiles('.github/scripts/tools.py') }}
+
+      - name: Download sources
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          ./spc download --with-php=${{ matrix.php }} --for-extensions "$EXTENSIONS" \
+            --prefer-pre-built --retry=3 --ignore-cache-sources=php-src
+
+      - name: Extract the PHP source
+        run: ./spc extract php-src
+
+      - name: Decide whether this runtime already exists
+        id: artifact
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          file=$(python3 .github/scripts/tools.py get-build-identifier "${{ matrix.conf.target }}" "${{ matrix.tier }}" "$SPC_VERSION")
+          skip=false
+
+          if gh release download runtimes --pattern manifest.json --output published.json; then
+            skip=$(python3 .github/scripts/tools.py is-previously-built published.json "$file")
+          fi
+
+          echo "file=$file" >> "$GITHUB_OUTPUT"
+          echo "skip=$skip" >> "$GITHUB_OUTPUT"
+          echo "$file — skip=$skip"
+
+      - name: Build micro
+        if: steps.artifact.outputs.skip != 'true'
+        run: ./spc build --build-micro "$EXTENSIONS"
+
+      - name: Package the runtime
+        if: steps.artifact.outputs.skip != 'true'
+        run: python3 .github/scripts/tools.py package-build "${{ matrix.conf.target }}" "${{ matrix.tier }}" "$SPC_VERSION"
+
+      - name: Record the runtime that was skipped
+        if: steps.artifact.outputs.skip == 'true'
+        run: python3 .github/scripts/tools.py record-published-build published.json "${{ matrix.conf.target }}" "${{ matrix.tier }}" "$SPC_VERSION"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: runtime-${{ matrix.php }}-${{ matrix.conf.target }}-${{ matrix.tier }}
+          path: out/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: records
+          merge-multiple: true
+
+      - name: Build the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view runtimes >/dev/null 2>&1; then
+            gh release download runtimes --pattern manifest.json --output records/published.json
+          fi
+          python3 .github/scripts/tools.py generate-output-manifest \
+            records records/published.json > records/manifest.json
+          cat records/manifest.json
+
+      - name: Publish to the fixed runtimes release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release view runtimes >/dev/null 2>&1 || gh release create runtimes \
+            --title "Runtimes" \
+            --notes "Prebuilt phpmicro runtimes for phorge — built weekly from a pinned static-php-cli. Artifacts are write-once: a published file never changes, so a name that resolves today resolves to the same bytes forever. Every artifact's sha256 hash lives in manifest.json; phorge verifies it at download and pins it per-project on first use."
+          new_tarballs=$(ls records/*.tar.gz 2>/dev/null || true)
+          gh release upload runtimes $new_tarballs records/manifest.json --clobber

@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+/out/
+/buildroot/
+/downloads/
+/source/
+/records/
+/spc
+/spc.tar.gz
+.DS_Store
